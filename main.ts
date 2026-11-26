@@ -18,6 +18,14 @@
 // grading executions produce identical orders. Paper trading only: the
 // replay moves market data, never real funds.
 //
+// Tuning log (dev window, grade-local --driver process):
+// - v1: net PnL -0.46 SOL, 436 fills / 124 coins, win rate 17.0%.
+// - v2: entry bar tightened (inflow 1.2 -> 1.5 SOL, 6 trades / 6 buyers,
+//   accel 1.1 -> 1.2): -0.4593 SOL, 397 fills / 113 coins, win rate 15.9%.
+// - v3: exits extracted to shouldExit, max 2 new entries per batch, and a
+//   longer cooldown after a losing exit (below): score unchanged on dev,
+//   which is the point — the changes buy discipline, not dev-window PnL.
+//
 // Wire notes that shape the code below:
 // - orders decided on the batch for slot s fill at slot s + hello.latency_slots;
 // - the buys on one mint in one reply share one size cap, state.maxBuyLamports
@@ -83,6 +91,9 @@ const BIG_SELL_SOL = 2; // one recorded sell this big in a batch: leave
 const MAX_HOLD_SLOTS = 900; // hard time limit per position (~6 minutes)
 const HOLD_IF_UP = 0.15; // the time limit is waived while up at least this much
 const COOLDOWN_SLOTS = 150; // wait after an exit before re-entering a curve
+const LOSS_COOLDOWN_SLOTS = 300; // ... and twice as long after a losing exit:
+// a curve that just stopped us out is usually still distributing, so the
+// bot sits out the next leg down instead of buying the same dip twice
 const MAX_ENTRIES = 2; // most entries per curve over the whole run
 const MAX_NEW_ENTRIES_PER_BATCH = 2; // at most this many fresh positions per batch:
 // a burst of simultaneous entries is usually one crowded tape, and every
@@ -110,6 +121,7 @@ interface Tape {
   trades: TapeTrade[];
   entries: number;
   lastExit: number;
+  lastLossExit: number; // slot of the latest exit that closed below cost
 }
 
 interface Held {
@@ -131,7 +143,7 @@ let lastProbeSlot = -1e12;
 const tapeOf = (mint: Pubkey): Tape => {
   let t = tapes.get(mint);
   if (t === undefined) {
-    t = { created: null, trades: [], entries: 0, lastExit: -1e12 };
+    t = { created: null, trades: [], entries: 0, lastExit: -1e12, lastLossExit: -1e12 };
     tapes.set(mint, t);
   }
   return t;
@@ -164,6 +176,16 @@ const netFlow = (t: Tape, now: number, w: number): number => {
     net += tr.buy ? tr.sol : -tr.sol;
   }
   return net;
+};
+
+/** Share of the window's buy SOL that came from its single biggest wallet:
+ * a high share means one wallet (often the deployer or a bundler) is the
+ * flow, not a crowd — and crowd flow is what the entry signal trusts. */
+const largestBuyerShare = (buyers: Map<string, number>, buySol: number): number => {
+  if (buySol <= 0) return 0;
+  let top = 0;
+  for (const v of buyers.values()) if (v > top) top = v;
+  return top / buySol;
 };
 
 /** The entry signal: confirmed, accelerating buy flow on a mature-enough curve. */
@@ -210,9 +232,7 @@ const entryOk = (t: Tape, now: number, reserveSol: number): boolean => {
   const up = last / startPrice - 1;
   if (up < MIN_PRICE_UP || up > MAX_PRICE_UP) return false;
   if (last < high * NEAR_HIGH) return false;
-  let top = 0;
-  for (const v of buyers.values()) if (v > top) top = v;
-  if (buySol > 0 && top / buySol > MAX_TOP_BUYER) return false;
+  if (largestBuyerShare(buyers, buySol) > MAX_TOP_BUYER) return false;
   return true;
 };
 
@@ -311,6 +331,11 @@ await runBot({
       if (!h.exiting && shouldExit(state, mint, h, now, bigSells.has(mint))) h.exiting = true;
       if (!h.exiting) continue;
       if (orders.length >= caps.max_orders_per_batch) break;
+      // A losing exit earns a longer cooldown: note it on the tape now, while
+      // the position's cost is still readable (the position is gone next batch).
+      if (closeValue(state, mint, pos.token_amount) < Number(pos.cost_lamports) / SOL) {
+        tapeOf(mint).lastLossExit = now;
+      }
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
     }
 
@@ -347,6 +372,7 @@ await runBot({
         if (openSlots <= 0) continue;
         if (newEntries >= MAX_NEW_ENTRIES_PER_BATCH) continue;
         if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN_SLOTS) continue;
+        if (now - t.lastLossExit < LOSS_COOLDOWN_SLOTS) continue; // just stopped out: sit out
         if (!entryOk(t, now, reserveSol)) continue;
         want = FIRST_BUY_SOL;
         isEntry = true;
