@@ -36,19 +36,23 @@ const CURVE_FEE = 0.0125; // 95 bps protocol + 30 bps creator, the fallback pair
 // The bar is deliberately high and the moves it accepts deliberately small:
 // Sharpe rewards consistency, so the bot wants coins that are grinding up on
 // broad flow, not vertical spikes (which revert) and not dead tapes.
+// Tightened after the first dev-window read: the entries that lost were the
+// weak-flow ones, and with 124 coins clearing the 20-coin round-trip bar
+// there is room to be pickier about flow quality instead of chasing volume.
 const FLOW_WINDOW = 50; // slots of tape the entry signal reads (~20 s)
 const MIN_AGE_SLOTS = 300; // a curve must be at least this old before a first buy
 const MIN_RESERVE_SOL = 2; // real SOL reserve band at entry: below is dust,
 const MAX_RESERVE_SOL = 60; // above is nearly complete (migration dumps follow)
-const MIN_NET_INFLOW = 1.2; // net SOL (buys - sells) over the flow window
-const MIN_BUY_TRADES = 5; // buy trades in the window
-const MIN_DISTINCT_BUYERS = 5; // distinct buying wallets in the window
+const MIN_NET_INFLOW = 1.5; // net SOL (buys - sells) over the flow window
+const MIN_BUY_TRADES = 6; // buy trades in the window
+const MIN_DISTINCT_BUYERS = 6; // distinct buying wallets in the window
 const MAX_SELL_SHARE = 0.35; // sells may be at most this share of window volume
 const MIN_PRICE_UP = 0.03; // price vs window start: at least +3% ...
 const MAX_PRICE_UP = 0.4; // ... but no more than +40% (do not chase a vertical)
 const NEAR_HIGH = 0.94; // price at least this share of the window high
 const MAX_TOP_BUYER = 0.5; // one wallet may be at most 50% of the window's buy SOL
-const MIN_ACCEL = 1.1; // newer half's net inflow must beat the older half's by this
+const MIN_ACCEL = 1.2; // newer half's net inflow must beat the older half's by this;
+// a pump whose second half is quieter than its first is a top, not a launchpad
 
 // ---- sizing -----------------------------------------------------------------
 // Tiny on purpose: with a 6% take profit the edge is a high hit rate on
@@ -80,6 +84,9 @@ const MAX_HOLD_SLOTS = 900; // hard time limit per position (~6 minutes)
 const HOLD_IF_UP = 0.15; // the time limit is waived while up at least this much
 const COOLDOWN_SLOTS = 150; // wait after an exit before re-entering a curve
 const MAX_ENTRIES = 2; // most entries per curve over the whole run
+const MAX_NEW_ENTRIES_PER_BATCH = 2; // at most this many fresh positions per batch:
+// a burst of simultaneous entries is usually one crowded tape, and every
+// extra order pays base + priority fee whether it fills or not
 
 // ---- guardrail probes --------------------------------------------------------
 // The bar: a round trip of at least 0.01 SOL on each of at least 20 coins.
@@ -209,6 +216,31 @@ const entryOk = (t: Tape, now: number, reserveSol: number): boolean => {
   return true;
 };
 
+/** Every exit reason in one place: take profit, stop, trailing stop, fading
+ * flow, a single huge sell, or the hard time limit. Returns true when the
+ * position should be sold whole this batch. Pure read of the tape and the
+ * position except for the peak update, so calling it twice is harmless. */
+const shouldExit = (
+  state: BotState,
+  mint: Pubkey,
+  h: Held,
+  now: number,
+  bigSell: boolean,
+): boolean => {
+  const pos = state.positions.get(mint);
+  if (pos === undefined) return false;
+  const value = closeValue(state, mint, pos.token_amount);
+  const cost = Number(pos.cost_lamports) / SOL;
+  if (value > h.peakValue) h.peakValue = value;
+  if (value >= cost * (1 + TAKE_PROFIT)) return true; // bank the +6%
+  if (value <= cost * (1 - STOP_LOSS)) return true; // cut at -4%
+  if (h.peakValue >= cost * (1 + TRAIL_ARM) && value <= h.peakValue * (1 - TRAIL_DROP)) return true;
+  if (netFlow(tapeOf(mint), now, FADE_WINDOW) < FADE_NET) return true;
+  if (bigSell) return true;
+  if (now - h.opened > MAX_HOLD_SLOTS && value < cost * (1 + HOLD_IF_UP)) return true;
+  return false;
+};
+
 await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     const now = batch.slot;
@@ -276,18 +308,8 @@ await runBot({
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue; // the harness closes it
       if (pendingMints.has(mint)) continue; // an order is in flight; decide next batch
-      const value = closeValue(state, mint, pos.token_amount);
-      const cost = Number(pos.cost_lamports) / SOL;
-      if (value > h.peakValue) h.peakValue = value;
-      let exit = h.exiting;
-      if (!exit && value >= cost * (1 + TAKE_PROFIT)) exit = true;
-      if (!exit && value <= cost * (1 - STOP_LOSS)) exit = true;
-      if (!exit && h.peakValue >= cost * (1 + TRAIL_ARM) && value <= h.peakValue * (1 - TRAIL_DROP)) exit = true;
-      if (!exit && netFlow(tapeOf(mint), now, FADE_WINDOW) < FADE_NET) exit = true;
-      if (!exit && bigSells.has(mint)) exit = true;
-      if (!exit && now - h.opened > MAX_HOLD_SLOTS && value < cost * (1 + HOLD_IF_UP)) exit = true;
-      if (!exit) continue;
-      h.exiting = true;
+      if (!h.exiting && shouldExit(state, mint, h, now, bigSells.has(mint))) h.exiting = true;
+      if (!h.exiting) continue;
       if (orders.length >= caps.max_orders_per_batch) break;
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
     }
@@ -309,6 +331,7 @@ await runBot({
     // ---- entries and adds, only on mints that traded this batch -------------
     let exposure = 0;
     for (const [, h] of held) exposure += h.invested;
+    let newEntries = 0;
     for (const mint of traded) {
       if (orders.length >= caps.max_orders_per_batch) break;
       const curve = state.curves.get(mint);
@@ -322,6 +345,7 @@ await runBot({
       let isEntry = false;
       if (h === undefined) {
         if (openSlots <= 0) continue;
+        if (newEntries >= MAX_NEW_ENTRIES_PER_BATCH) continue;
         if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN_SLOTS) continue;
         if (!entryOk(t, now, reserveSol)) continue;
         want = FIRST_BUY_SOL;
@@ -352,6 +376,7 @@ await runBot({
         held.set(mint, { opened: now, invested: amount, peakValue: 0, lastBuyPrice: price, exiting: false, filled: false });
         t.entries++;
         openSlots--;
+        newEntries++;
       } else if (h !== undefined) {
         h.invested += amount;
         h.lastBuyPrice = price;
